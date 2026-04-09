@@ -1,18 +1,19 @@
 """
-LINE Messaging API Chatbot with Gemini Integration
-====================================================
+LINE Messaging API Chatbot with Gemini Integration (REST API)
+==============================================================
 Real Estate AI Assistant for Taichung Coastal Area (海線房仲冠良)
-Optimized for Render deployment
-Version 2.0: Added keyword-based auto-reply feature
+Optimized for Render deployment (No native dependencies)
+Version 3.0: Using requests + Gemini REST API (no google-generativeai)
 """
 
 import os
 import logging
 import threading
+import json
 from typing import Dict, List, Optional
 
 from flask import Flask, request, abort
-import google.generativeai as genai
+import requests
 
 from linebot.v3.webhook import WebhookHandler
 from linebot.v3.webhooks import (
@@ -38,15 +39,16 @@ CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "P/wSj0eK8bVQ
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDVk_jfOjdaR-y8L6iOsVWig5LDfBXNmZg")
 PORT = int(os.environ.get("PORT", 8080))
 
+# Gemini API Configuration
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_REQUEST_TIMEOUT = 30  # seconds
+
 # Validate required environment variables
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN or not GEMINI_API_KEY:
     raise ValueError(
         "Missing required environment variables: "
         "LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, and GEMINI_API_KEY"
     )
-
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
 
 # ---------------------------------------------------------------------------
 # Keyword-based Auto-Reply Dictionary
@@ -154,8 +156,11 @@ def check_keyword_reply(user_message: str) -> Optional[str]:
     return None
 
 
-def get_gemini_reply(user_id: str, user_message: str) -> str:
-    """Call Gemini API with conversation context and return the reply."""
+def get_gemini_reply_via_rest_api(user_id: str, user_message: str) -> str:
+    """
+    Call Gemini API via REST API using requests library.
+    Maintains conversation history for context-aware responses.
+    """
     with conversation_lock:
         history = conversation_history.setdefault(user_id, [])
         history.append({"role": "user", "content": user_message})
@@ -163,36 +168,60 @@ def get_gemini_reply(user_id: str, user_message: str) -> str:
         if len(history) > MAX_HISTORY * 2:
             history[:] = history[-MAX_HISTORY * 2 :]
         
-        # Build conversation history for Gemini
-        messages = []
+        # Build conversation history for Gemini API
+        contents = []
         for msg in history:
-            messages.append({
+            contents.append({
                 "role": msg["role"],
                 "parts": [{"text": msg["content"]}]
             })
 
     try:
-        # Initialize Gemini model
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=SYSTEM_PROMPT
+        # Prepare request payload for Gemini REST API
+        payload = {
+            "contents": contents,
+            "systemInstruction": {
+                "parts": [{"text": SYSTEM_PROMPT}]
+            },
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 500,
+            }
+        }
+        
+        # Make request to Gemini API
+        response = requests.post(
+            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+            json=payload,
+            timeout=GEMINI_REQUEST_TIMEOUT,
+            headers={"Content-Type": "application/json"}
         )
         
-        # Generate response
-        response = model.generate_content(
-            messages,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=500,
-                temperature=0.7,
-            )
-        )
+        # Handle API response
+        if response.status_code != 200:
+            logger.error("Gemini API error: %d - %s", response.status_code, response.text)
+            assistant_msg = "抱歉，目前系統忙碌中，請稍後再試 🙏"
+        else:
+            response_data = response.json()
+            
+            # Extract text from response
+            try:
+                assistant_msg = response_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (KeyError, IndexError, TypeError) as e:
+                logger.error("Failed to parse Gemini response: %s", e)
+                assistant_msg = "抱歉，無法解析回覆，請稍後再試 🙏"
         
-        assistant_msg = response.text.strip()
-        
+    except requests.exceptions.Timeout:
+        logger.error("Gemini API timeout")
+        assistant_msg = "抱歉，系統回應超時，請稍後再試 🙏"
+    except requests.exceptions.RequestException as e:
+        logger.error("Gemini API request error: %s", e)
+        assistant_msg = "抱歉，系統連線失敗，請稍後再試 🙏"
     except Exception as e:
-        logger.error("Gemini API error: %s", e)
-        assistant_msg = "抱歉，目前系統忙碌中，請稍後再試 🙏"
+        logger.error("Unexpected error: %s", e)
+        assistant_msg = "抱歉，發生未預期的錯誤，請稍後再試 🙏"
 
+    # Store assistant response in history
     with conversation_lock:
         history = conversation_history.setdefault(user_id, [])
         history.append({"role": "assistant", "content": assistant_msg})
@@ -218,7 +247,7 @@ def reply_line_message(reply_token: str, text: str) -> None:
 @app.route("/", methods=["GET"])
 def index():
     """Health check endpoint."""
-    return "LINE Bot @asmile 海線房仲冠良 (Gemini v2.0) is running on Render! 🚀", 200
+    return "LINE Bot @asmile 海線房仲冠良 (Gemini REST API v3.0) is running on Render! 🚀", 200
 
 
 @app.route("/health", methods=["GET"])
@@ -264,8 +293,8 @@ def handle_text_message(event: MessageEvent) -> None:
         reply_text = keyword_reply
         logger.info("Using keyword reply for user %s", user_id)
     else:
-        # Generate AI reply using Gemini
-        reply_text = get_gemini_reply(user_id, user_text)
+        # Generate AI reply using Gemini REST API
+        reply_text = get_gemini_reply_via_rest_api(user_id, user_text)
         logger.info("Using Gemini reply for user %s: %s", user_id, reply_text[:80])
 
     # Send reply
@@ -310,5 +339,5 @@ def handle_default(event) -> None:
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting LINE Bot server (Gemini v2.0) on port %d", PORT)
+    logger.info("Starting LINE Bot server (Gemini REST API v3.0) on port %d", PORT)
     app.run(host="0.0.0.0", port=PORT, debug=False)
