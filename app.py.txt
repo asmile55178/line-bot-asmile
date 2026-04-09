@@ -1,0 +1,314 @@
+"""
+LINE Messaging API Chatbot with Gemini Integration
+====================================================
+Real Estate AI Assistant for Taichung Coastal Area (海線房仲冠良)
+Optimized for Render deployment
+Version 2.0: Added keyword-based auto-reply feature
+"""
+
+import os
+import logging
+import threading
+from typing import Dict, List, Optional
+
+from flask import Flask, request, abort
+import google.generativeai as genai
+
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+    FollowEvent,
+    UnfollowEvent,
+)
+from linebot.v3.messaging import (
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+    Configuration,
+    ApiClient,
+)
+from linebot.v3.exceptions import InvalidSignatureError
+
+# ---------------------------------------------------------------------------
+# Configuration from Environment Variables
+# ---------------------------------------------------------------------------
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "1c6dbb01e27aee4c0e137534bf07f8db")
+CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "P/wSj0eK8bVQ/FGDrA7wm/O3kppZBlukqUJBFszQS4rQYA/H0wUAxDLyf6SmmWW4558vglYQ4psInje0lGtz6VZcByBgCzCA6KP2/ae5QvtINvPcvX/8meVMOap98ZcmtfKR2SoBSN8Sw35dsAEwxQdB04t89/1O/w1cDnyilFU=")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDVk_jfOjdaR-y8L6iOsVWig5LDfBXNmZg")
+PORT = int(os.environ.get("PORT", 8080))
+
+# Validate required environment variables
+if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN or not GEMINI_API_KEY:
+    raise ValueError(
+        "Missing required environment variables: "
+        "LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, and GEMINI_API_KEY"
+    )
+
+# Configure Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ---------------------------------------------------------------------------
+# Keyword-based Auto-Reply Dictionary
+# ---------------------------------------------------------------------------
+KEYWORD_REPLIES = {
+    "房東避坑": "您好，這是我整理的房東避坑攻略 https://reurl.cc/Dxm0nm 請點擊下載運用。有問題可以直接詢問",
+    "賣房避坑": "賣房避坑50條攻略 https://reurl.cc/ep3mL7",
+    "重購": "點擊 https://reurl.cc/L2p47X",
+    "買房避坑": "買房避坑100條攻略 https://docs.google.com/document/d/1VQU7FzTYpf2_Q_vC88bFAfeTd-9Bd9AY/edit?usp=drive_link&ouid=102602626714744727303&rtpof=true&sd=true",
+}
+
+# ---------------------------------------------------------------------------
+# Enhanced System Prompt with Real Estate Database
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = """你是「海線房仲冠良」的 AI 助理。
+
+【角色設定】
+- 你是一位親切專業的房地產顧問，像朋友一樣聊天但保持專業度
+- 服務區域：台中海線（大甲、清水、沙鹿、梧棲、龍井），也可跨台中市
+- 你的目標是幫助客戶找到理想的房子，並在需要時引導他們聯繫冠良本人
+
+【物件資料庫 - 精選物件】
+1. 清水區：朝南高視野兩房平車
+   - 價格：968 萬
+   - 特色：全新屋，朝南採光好，視野開闊
+   
+2. 沙鹿區：家樂福旁臨路雙車大地坪美墅
+   - 價格：1,598 萬
+   - 特色：臨路、雙車位、大地坪、美式風格
+   
+3. 沙鹿區：新光田特區唯一綠景無限棟距
+   - 價格：1,530 萬
+   - 特色：新光田醫院特區、綠景、無限棟距、採光佳
+   
+4. 沙鹿區：沙鹿家樂福巷內臨路透天
+   - 價格：1,388 萬
+   - 特色：家樂福商圈、臨路、生活機能好
+   
+5. 大甲區：近大甲國中建地
+   - 價格：798 萬
+   - 特色：建地、近學區、適合投資
+
+【海線在地知識】
+- 大甲：媽祖文化（鎮瀾宮）、大甲市場、適合首購、文化底蘊深厚
+- 清水：高美濕地、清水眷村、發展中、CP值高、年輕家庭首選
+- 沙鹿：生活機能好、家樂福商圈、近台中市區、發展成熟
+- 梧棲：三井 Outlet、梧棲漁港、新興發展區、商業前景看好
+- 龍井：東海大學、藝術街、適合學區需求、文藝氛圍
+
+【對話指南】
+- 親切回答客戶的各種房產相關問題
+- 根據客戶需求推薦合適的物件
+- 提供海線在地生活資訊
+- 當客戶表示想看房或有深入需求時，主動引導聯繫冠良本人
+
+【聯絡資訊】
+- 📞 冠良電話/LINE：0915-295-958
+- LINE 官方帳號：@asmile
+- 當客戶需要看房或進一步諮詢時，提供上述聯絡方式
+
+【回覆風格】
+- 使用繁體中文，親切友善
+- 回覆簡潔明瞭，控制在 300 字以內
+- 適當使用表情符號增加親近感
+- 如果不確定答案，誠實告知並建議聯繫冠良本人
+"""
+
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Flask App & LINE SDK Setup
+# ---------------------------------------------------------------------------
+app = Flask(__name__)
+
+handler = WebhookHandler(CHANNEL_SECRET)
+configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+
+# ---------------------------------------------------------------------------
+# Per-user conversation history (in-memory, thread-safe)
+# ---------------------------------------------------------------------------
+conversation_lock = threading.Lock()
+conversation_history: Dict[str, List[Dict]] = {}
+MAX_HISTORY = 10  # keep last N turns per user
+
+
+def check_keyword_reply(user_message: str) -> Optional[str]:
+    """
+    Check if user message contains any keyword for auto-reply.
+    Returns the auto-reply message if keyword is found, otherwise None.
+    """
+    user_message_lower = user_message.lower()
+    
+    for keyword, reply in KEYWORD_REPLIES.items():
+        if keyword.lower() in user_message_lower:
+            logger.info("Keyword matched: %s", keyword)
+            return reply
+    
+    return None
+
+
+def get_gemini_reply(user_id: str, user_message: str) -> str:
+    """Call Gemini API with conversation context and return the reply."""
+    with conversation_lock:
+        history = conversation_history.setdefault(user_id, [])
+        history.append({"role": "user", "content": user_message})
+        # Trim to keep memory bounded
+        if len(history) > MAX_HISTORY * 2:
+            history[:] = history[-MAX_HISTORY * 2 :]
+        
+        # Build conversation history for Gemini
+        messages = []
+        for msg in history:
+            messages.append({
+                "role": msg["role"],
+                "parts": [{"text": msg["content"]}]
+            })
+
+    try:
+        # Initialize Gemini model
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=SYSTEM_PROMPT
+        )
+        
+        # Generate response
+        response = model.generate_content(
+            messages,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=500,
+                temperature=0.7,
+            )
+        )
+        
+        assistant_msg = response.text.strip()
+        
+    except Exception as e:
+        logger.error("Gemini API error: %s", e)
+        assistant_msg = "抱歉，目前系統忙碌中，請稍後再試 🙏"
+
+    with conversation_lock:
+        history = conversation_history.setdefault(user_id, [])
+        history.append({"role": "assistant", "content": assistant_msg})
+
+    return assistant_msg
+
+
+def reply_line_message(reply_token: str, text: str) -> None:
+    """Send a text reply via LINE Messaging API."""
+    with ApiClient(configuration) as api_client:
+        messaging_api = MessagingApi(api_client)
+        messaging_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=text)],
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def index():
+    """Health check endpoint."""
+    return "LINE Bot @asmile 海線房仲冠良 (Gemini v2.0) is running on Render! 🚀", 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint for Render."""
+    return {"status": "healthy"}, 200
+
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    """LINE Webhook callback endpoint."""
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    logger.info("Webhook received (%d bytes)", len(body))
+
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        logger.warning("Invalid signature – rejected request")
+        abort(400)
+    except Exception as e:
+        logger.error("Error handling webhook: %s", e)
+        abort(500)
+
+    return "OK"
+
+
+# ---------------------------------------------------------------------------
+# Event Handlers
+# ---------------------------------------------------------------------------
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_text_message(event: MessageEvent) -> None:
+    """Handle incoming text messages from LINE users."""
+    user_id = event.source.user_id
+    user_text = event.message.text
+    logger.info("Message from %s: %s", user_id, user_text[:100])
+
+    # Check for keyword-based auto-reply first
+    keyword_reply = check_keyword_reply(user_text)
+    
+    if keyword_reply:
+        # Use keyword-based reply (skip Gemini)
+        reply_text = keyword_reply
+        logger.info("Using keyword reply for user %s", user_id)
+    else:
+        # Generate AI reply using Gemini
+        reply_text = get_gemini_reply(user_id, user_text)
+        logger.info("Using Gemini reply for user %s: %s", user_id, reply_text[:80])
+
+    # Send reply
+    try:
+        reply_line_message(event.reply_token, reply_text)
+    except Exception as e:
+        logger.error("Failed to reply: %s", e)
+
+
+@handler.add(FollowEvent)
+def handle_follow(event: FollowEvent) -> None:
+    """Handle new follower events – send welcome message."""
+    welcome = (
+        "您好！👋 歡迎加入「海線房仲冠良」的 LINE 官方帳號 😊\n\n"
+        "我是 AI 智慧助理，專門協助您了解台中海線（大甲、清水、沙鹿、梧棲、龍井）的房產資訊。\n\n"
+        "有任何房屋買賣、租賃或海線生活相關問題，都可以直接傳訊息給我！\n\n"
+        "如需看房或進一步諮詢，可聯繫冠良本人：\n"
+        "📞 0915-295-958（LINE同）"
+    )
+    try:
+        reply_line_message(event.reply_token, welcome)
+    except Exception as e:
+        logger.error("Failed to send welcome: %s", e)
+
+
+@handler.add(UnfollowEvent)
+def handle_unfollow(event: UnfollowEvent) -> None:
+    """Handle unfollow events – clean up conversation history."""
+    user_id = event.source.user_id
+    with conversation_lock:
+        conversation_history.pop(user_id, None)
+    logger.info("User %s unfollowed, history cleared", user_id)
+
+
+@handler.default()
+def handle_default(event) -> None:
+    """Log unhandled events."""
+    logger.info("Unhandled event: %s", type(event).__name__)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    logger.info("Starting LINE Bot server (Gemini v2.0) on port %d", PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
